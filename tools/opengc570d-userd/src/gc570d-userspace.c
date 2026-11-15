@@ -13,6 +13,7 @@
 
 #include <dirent.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -3045,6 +3046,24 @@ int main(int argc, char **argv)
 	bool want_headless = false;
 	bool want_studio = false;
 	int ret;
+
+	/*
+	 * Capture is timing-sensitive: the card's DMA must be re-armed and
+	 * completed frames drained within a few ms of each vsync, and ordinary
+	 * scheduling latency under load drops ~2-4 frames/s at 1080p60.  Run
+	 * with realtime priority when allowed (needs cap_sys_nice on the binary,
+	 * or an rtprio rlimit); threads created later inherit it.  Set
+	 * GC570D_NO_RT=1 to opt out.  Failure is harmless.
+	 */
+	if (!getenv("GC570D_NO_RT")) {
+		struct sched_param rt_sp = { .sched_priority = 20 };
+
+		if (sched_setscheduler(0, SCHED_FIFO, &rt_sp) == 0)
+			fprintf(stderr, "[gc570d] realtime scheduling enabled (SCHED_FIFO, priority 20)\n");
+		else
+			fprintf(stderr, "[gc570d] realtime scheduling unavailable (%s); frame rate may dip under load\n",
+				strerror(errno));
+	}
 
 	for (int i = 1; i < argc; i++) {
 		const char *arg = argv[i];
