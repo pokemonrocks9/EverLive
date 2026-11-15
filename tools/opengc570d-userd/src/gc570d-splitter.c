@@ -7598,6 +7598,14 @@ static unsigned int gc570d_it68051_audio_rate(u8 b5, u8 b6)
 	case 0x0e:
 		return 192000;
 	default:
+		/*
+		 * Some sources set the extra bits taken from regb6 (observed
+		 * 0x32 from a Wii U) while the sample-rate nibble in regb5
+		 * still says 48 kHz.  Rejecting those leaves capture stuck in
+		 * "recovering" with no audio, so trust the nibble for 48 kHz.
+		 */
+		if ((b5 & 0x0f) == 0x02)
+			return 48000;
 		return 0;
 	}
 }
