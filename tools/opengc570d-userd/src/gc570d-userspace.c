@@ -1857,15 +1857,95 @@ void vb2_queue_error(struct vb2_queue *vq)
 	(void)vq;
 }
 
+/*
+ * HDMI IN 2 is one-shot DMA: the next frame is only captured if the descriptor
+ * is re-armed before the next vsync (~0.7 ms of blanking at 1080p60).  The two
+ * 4 MB copies below take longer than that, so they run on a worker thread and
+ * the capture thread re-arms the next buffer immediately.
+ */
+#define GC570D_DONE_RING 8
+static struct vb2_buffer *g_done_ring[GC570D_DONE_RING];
+static unsigned int g_done_head, g_done_tail, g_done_busy;
+static pthread_mutex_t g_done_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_done_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_done_idle = PTHREAD_COND_INITIALIZER;
+static pthread_once_t g_done_once = PTHREAD_ONCE_INIT;
+
+static void gc570d_publish_frame(struct vb2_buffer *vb, bool requeue);
+
+static void *gc570d_done_worker(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		struct vb2_buffer *vb;
+
+		pthread_mutex_lock(&g_done_lock);
+		while (g_done_head == g_done_tail)
+			pthread_cond_wait(&g_done_cond, &g_done_lock);
+		vb = g_done_ring[g_done_tail % GC570D_DONE_RING];
+		g_done_tail++;
+		g_done_busy = 1;
+		pthread_mutex_unlock(&g_done_lock);
+
+		gc570d_publish_frame(vb, true);
+
+		pthread_mutex_lock(&g_done_lock);
+		g_done_busy = 0;
+		if (g_done_head == g_done_tail)
+			pthread_cond_broadcast(&g_done_idle);
+		pthread_mutex_unlock(&g_done_lock);
+	}
+	return NULL;
+}
+
+static void gc570d_done_start(void)
+{
+	pthread_t t;
+
+	if (!pthread_create(&t, NULL, gc570d_done_worker, NULL))
+		pthread_detach(t);
+}
+
+/* Wait until every queued frame has been copied (before freeing DMA memory). */
+static void gc570d_done_drain(void)
+{
+	pthread_mutex_lock(&g_done_lock);
+	while (g_done_head != g_done_tail || g_done_busy)
+		pthread_cond_wait(&g_done_idle, &g_done_lock);
+	pthread_mutex_unlock(&g_done_lock);
+}
+
 void vb2_buffer_done(struct vb2_buffer *vb, enum vb2_buffer_state state)
 {
 	struct vb2_queue *vq = vb ? vb->vb2_queue : NULL;
 	if (!vq)
 		return;
 
-	int port = vq->port_index;
-	if (port >= 0 && port < 2 && state == VB2_BUF_STATE_DONE &&
+	if (vq->port_index == 1 && state == VB2_BUF_STATE_DONE &&
 	    vb->vaddr && vb->payload > 0 && !atomic_load(&g_daemon_quit)) {
+		pthread_once(&g_done_once, gc570d_done_start);
+		pthread_mutex_lock(&g_done_lock);
+		if (g_done_head - g_done_tail < GC570D_DONE_RING) {
+			g_done_ring[g_done_head % GC570D_DONE_RING] = vb;
+			g_done_head++;
+			pthread_cond_signal(&g_done_cond);
+			pthread_mutex_unlock(&g_done_lock);
+			return;
+		}
+		pthread_mutex_unlock(&g_done_lock);
+	}
+	gc570d_publish_frame(vb, true);
+}
+
+static void gc570d_publish_frame(struct vb2_buffer *vb, bool requeue)
+{
+	struct vb2_queue *vq = vb ? vb->vb2_queue : NULL;
+	if (!vq)
+		return;
+
+	int port = vq->port_index;
+	if (port >= 0 && port < 2 && vb->vaddr && vb->payload > 0 &&
+	    !atomic_load(&g_daemon_quit)) {
 		struct gc570d_user_video_stream *vs = &g_vstreams[port];
 		pthread_mutex_lock(&vs->frame_lock);
 		if (vs->latest_yuy2 && vb->payload <= vs->latest_size) {
@@ -1930,7 +2010,7 @@ void vb2_buffer_done(struct vb2_buffer *vb, enum vb2_buffer_state state)
 
 
 		/* Re-queue buffer back to hardware capture thread */
-		if (vq->streaming && vq->ops && vq->ops->buf_queue)
+		if (requeue && vq->streaming && vq->ops && vq->ops->buf_queue)
 			vq->ops->buf_queue(vb);
 	}
 }
@@ -1980,14 +2060,13 @@ void video_unregister_device(struct video_device *vdev)
 		if (vs->vq->ops && vs->vq->ops->stop_streaming)
 			vs->vq->ops->stop_streaming(vs->vq);
 	}
-	if (vs->shared_dma_vaddr) {
-		dma_free_coherent(vs->vq->dev, GC570D_DMA_FRAME_SIZE,
-				  vs->shared_dma_vaddr, vs->shared_dma_iova);
-		vs->shared_dma_vaddr = NULL;
-		vs->shared_dma_iova = 0;
-	}
+	if (port == 1)
+		gc570d_done_drain();
 	for (int i = 0; i < GC570D_USER_VIDEO_BUFFERS; i++) {
 		struct vb2_buffer *vb = &vs->buffers[i].vb.vb2_buf;
+		if (port == 1 && vb->vaddr)
+			dma_free_coherent(vs->vq->dev, GC570D_DMA_FRAME_SIZE,
+					  vb->vaddr, vb->dma_addr);
 		if (port == 0 && vb->vaddr)
 			free(vb->vaddr);
 		vb->vaddr = NULL;
@@ -2015,15 +2094,6 @@ static int gc570d_start_user_video_streams(void)
 		struct gc570d_user_video_stream *vs = &g_vstreams[port];
 		if (!vs->vq || !vs->vq->ops)
 			continue;
-		if (port == 1) {
-			vs->shared_dma_vaddr = dma_alloc_coherent(
-				vs->vq->dev, GC570D_DMA_FRAME_SIZE,
-				&vs->shared_dma_iova, GFP_KERNEL);
-			if (!vs->shared_dma_vaddr) {
-				first_err = -ENOMEM;
-				continue;
-			}
-		}
 		for (int i = 0; i < GC570D_USER_VIDEO_BUFFERS; i++) {
 			struct vb2_buffer *vb = &vs->buffers[i].vb.vb2_buf;
 			vb->vb2_queue = vs->vq;
@@ -2034,8 +2104,9 @@ static int gc570d_start_user_video_streams(void)
 				vb->vaddr = calloc(1, GC570D_DMA_FRAME_SIZE);
 				vb->dma_addr = 0;
 			} else {
-				vb->vaddr = vs->shared_dma_vaddr;
-				vb->dma_addr = vs->shared_dma_iova;
+				vb->vaddr = dma_alloc_coherent(
+					vs->vq->dev, GC570D_DMA_FRAME_SIZE,
+					&vb->dma_addr, GFP_KERNEL);
 			}
 			if (!vb->vaddr) {
 				first_err = -ENOMEM;
