@@ -80,6 +80,7 @@ struct everlive_v4l2 {
 	uint64_t idle_skips;
 	bool reader_active;
 	bool configured;
+	bool primed;
 };
 
 struct everlive_state {
@@ -386,6 +387,7 @@ static void everlive_v4l2_close(struct everlive_v4l2 *out)
 		out->fd = -1;
 	}
 	out->configured = false;
+	out->primed = false;
 }
 
 /*
@@ -471,7 +473,13 @@ static void everlive_v4l2_write(struct everlive_v4l2 *out,
 		out->reader_active = everlive_v4l2_reader_active(out->path);
 		out->last_reader_check_ns = now;
 	}
-	if (!out->reader_active) {
+	/*
+	 * v4l2loopback refuses VIDIOC_STREAMON from a reader until the writer
+	 * has delivered a first frame, so a reader can never appear (and the
+	 * sysfs check above never turn true) if nothing is written while idle.
+	 * Always write one frame after (re)opening to prime the device.
+	 */
+	if (!out->reader_active && out->primed) {
 		out->idle_skips++;
 		return;
 	}
@@ -480,6 +488,7 @@ static void everlive_v4l2_write(struct everlive_v4l2 *out,
 	written = write(out->fd, frame->pixels, bytes);
 	if (written == (ssize_t)bytes) {
 		out->frames++;
+		out->primed = true;
 		return;
 	}
 	if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
