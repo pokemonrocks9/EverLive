@@ -116,7 +116,7 @@ LIMITS_DIR := $(DESTDIR)/etc/security/limits.d
 install-bin: all
 	install -d $(BINDIR) $(LIBDIR)
 	install -m 0755 opengc570d-userd gc570d-ctl $(BINDIR)/
-	command -v setcap >/dev/null 2>&1 && setcap cap_ipc_lock=+ep $(BINDIR)/opengc570d-userd 2>/dev/null || true
+	command -v setcap >/dev/null 2>&1 && setcap cap_ipc_lock,cap_sys_nice=+ep $(BINDIR)/opengc570d-userd 2>/dev/null || true
 	install -m 0644 libgc570d-v4l2.so $(LIBDIR)/
 
 install-system:

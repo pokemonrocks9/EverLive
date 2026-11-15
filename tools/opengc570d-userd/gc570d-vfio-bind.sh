@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 # Bind AVerMedia Live Gamer DUO GC570D (1461:0054, subsystem 1461:5700) to vfio-pci
-# and grant cap_ipc_lock=+ep to opengc570d-userd so VFIO_IOMMU_MAP_DMA can pin
+# and grant cap_ipc_lock,cap_sys_nice=+ep to opengc570d-userd so VFIO_IOMMU_MAP_DMA can pin
 # all dual-HDMI DMA rings above the default 8 MiB RLIMIT_MEMLOCK.
 
 set -eu
@@ -44,5 +44,5 @@ for devnode in /dev/vfio/*; do
 done
 
 if command -v setcap >/dev/null 2>&1 && [ -f "$SCRIPT_DIR/opengc570d-userd" ]; then
-    setcap cap_ipc_lock=+ep "$SCRIPT_DIR/opengc570d-userd" 2>/dev/null || true
+    setcap cap_ipc_lock,cap_sys_nice=+ep "$SCRIPT_DIR/opengc570d-userd" 2>/dev/null || true
 fi

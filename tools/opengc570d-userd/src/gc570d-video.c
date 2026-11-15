@@ -458,6 +458,10 @@ static int gc570d_video_thread(void *data)
 	dma_addr_t frame_dma;
 	u64 no_signal_deadline = 0;
 	u64 next_link_poll_ns = 0;
+	bool pf_done = false;
+	u16 pf_w = 0, pf_h = 0, pf_rate = 0;
+	bool pf_i = false;
+	int pf_fmt_ret = 0, pf_rate_ret = 0;
 	u64 next_format_poll_ns = 0;
 	u64 hpd_retry_ns = 0;
 	unsigned int no_scdt_polls = 0;
@@ -549,6 +553,29 @@ static int gc570d_video_thread(void *data)
 		writel(BIT(1) | BIT(0),
 		       gc->bar0 + GC570D_DMA_DESC_CONTROL);
 
+		/*
+		 * Poll the receiver while the frame is being captured, not
+		 * between frames: the I2C reads take longer than the vblank
+		 * re-arm window and cost a frame every time they ran there.
+		 */
+		pf_done = false;
+		if (ktime_get_ns() >= next_format_poll_ns &&
+		    mutex_trylock(&gc->capture_lock)) {
+			pf_w = 0;
+			pf_h = 0;
+			pf_rate = 0;
+			pf_i = false;
+			pf_fmt_ret = gc570d_dma_detect_vip1_format(gc, &pf_w,
+								   &pf_h,
+								   &pf_i);
+			pf_rate_ret = pf_fmt_ret ? pf_fmt_ret :
+				gc570d_it6802_frame_rate(gc, &pf_rate);
+			mutex_unlock(&gc->capture_lock);
+			next_format_poll_ns = ktime_get_ns() +
+				2 * GC570D_HDMI2_LINK_POLL_NS;
+			pf_done = true;
+		}
+
 		completed = 0;
 		int poll_ms = gc570d_cfg.hdmi2_poll_ms > 0 ?
 			      gc570d_cfg.hdmi2_poll_ms : GC570D_HDMI2_DMA_POLL_MS;
@@ -629,23 +656,14 @@ static int gc570d_video_thread(void *data)
 				      gc570d_video_frame_size(gc));
 		vb2_buffer_done(&buffer->vb.vb2_buf, VB2_BUF_STATE_DONE);
 
-		if (ktime_get_ns() >= next_format_poll_ns &&
-		    mutex_trylock(&gc->capture_lock)) {
-			u16 live_w = 0;
-			u16 live_h = 0;
-			u16 live_rate = 0;
-			bool live_i = false;
-			int rate_ret;
-			int fmt_ret;
+		if (pf_done) {
+			u16 live_w = pf_w;
+			u16 live_h = pf_h;
+			u16 live_rate = pf_rate;
+			bool live_i = pf_i;
+			int rate_ret = pf_rate_ret;
+			int fmt_ret = pf_fmt_ret;
 
-			fmt_ret = gc570d_dma_detect_vip1_format(gc, &live_w,
-								&live_h,
-								&live_i);
-			rate_ret = fmt_ret ? fmt_ret :
-				gc570d_it6802_frame_rate(gc, &live_rate);
-			mutex_unlock(&gc->capture_lock);
-			next_format_poll_ns = ktime_get_ns() +
-				2 * GC570D_HDMI2_LINK_POLL_NS;
 			if (!rate_ret)
 				WRITE_ONCE(gc->video_input_frame_rate,
 					   live_rate);
